@@ -239,6 +239,7 @@ examples/
   k_eigenvalue.py
   time_dependent.py
   transport_cross_sections.py
+  c5g7_quarter_core.py
 ```
 
 ## Running tests
@@ -279,7 +280,8 @@ The output is written to `docs/doxygen/html/`.
 **Physics**
 - Delayed neutron precursor groups in the time-dependent solver (currently
   prompt-only), and implicit treatment of the fission source (currently explicit)
-- Adjoint flux solver for sensitivity and perturbation analysis
+- Sensitivity and perturbation analysis built on the adjoint importance
+  function (the adjoint materials transform `make_adjoint_materials` now exists)
 - Depletion coupling - Bateman equations for nuclide inventory evolution
 
 **Solvers and performance**
@@ -296,4 +298,6 @@ The output is written to `docs/doxygen/html/`.
 **Testing**
 - Published two-group benchmark regressions are in `tests/test_benchmarks.py`
   (1-D Ringhals-4 slab, 2-D TWIGL, 2-D IAEA PWR on the stepped quarter core);
-  still to add: BIBLIS-2D and C5G7 diffusion via `tools/c5g7_fuel_mesh.py`
+  the C5G7 quarter core runs end-to-end in `examples/c5g7_quarter_core.py`
+  (mesh + 7-group transport cross sections + unstructured solver); still to add:
+  BIBLIS-2D, and a CI-sized C5G7 diffusion regression
