@@ -18,12 +18,19 @@ eigenvalue is not expected to match the published transport reference
 (k = 1.18655) to pcm.  The cross-section file is named "critical", i.e. tuned so
 the 2-D diffusion solution is close to critical (k ~ 1).
 
+The solver stops on the flux-change norm (``--epsilon``); the eigenvalue itself
+converges several iterations sooner, so keff is good to a few pcm well before the
+flux fully settles.  The default mesh (``--lc 1.0``) is deliberately coarse so
+the demo finishes in a few minutes.  The coarse mesh is *not* mesh-converged
+(keff ~ 1.201 here vs ~ 1.189 at lc=0.5); a finer ``--lc`` lowers keff and is
+more accurate but the per-iteration cost grows with the cell count.
+
 Run after installing the package (needs the optional mesh + h5py deps):
     pip install -e ".[mesh]"
     pip install h5py
-    python examples/c5g7_quarter_core.py                     # default lc = 0.5
+    python examples/c5g7_quarter_core.py                     # default lc = 1.0
     python examples/c5g7_quarter_core.py --mesh my.msh       # reuse a mesh
-    python examples/c5g7_quarter_core.py --lc 0.3            # finer, slower
+    python examples/c5g7_quarter_core.py --lc 0.5            # finer, slower
 """
 
 import argparse
@@ -158,8 +165,8 @@ def main():
     p = argparse.ArgumentParser(description="C5G7 quarter-core diffusion k-eigenvalue.")
     p.add_argument("--mesh", default=DEFAULT_MESH, help="Gmsh .msh path (generated if absent)")
     p.add_argument("--xs",   default=DEFAULT_XS,   help="C5G7 HDF5 cross-section file")
-    p.add_argument("--lc",   type=float, default=0.5, help="Mesh size if generating (cm)")
-    p.add_argument("--epsilon", type=float, default=1e-5, help="k-eigenvalue tolerance")
+    p.add_argument("--lc",   type=float, default=1.0, help="Mesh size if generating (cm)")
+    p.add_argument("--epsilon", type=float, default=1e-3, help="flux-change tolerance")
     p.add_argument("--max-outer", type=int, default=500, help="Max power iterations")
     p.add_argument("--verbose", action="store_true", help="Print solver convergence")
     p.add_argument("--output", default=None, help="Flux output .npy (default: alongside mesh)")
