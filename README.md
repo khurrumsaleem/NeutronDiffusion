@@ -297,7 +297,7 @@ The output is written to `docs/doxygen/html/`.
 
 **Testing**
 - Published two-group benchmark regressions are in `tests/test_benchmarks.py`
-  (1-D Ringhals-4 slab, 2-D TWIGL, 2-D IAEA PWR on the stepped quarter core);
-  the C5G7 quarter core runs end-to-end in `examples/c5g7_quarter_core.py`
-  (mesh + 7-group transport cross sections + unstructured solver); still to add:
-  BIBLIS-2D, and a CI-sized C5G7 diffusion regression
+  (1-D Ringhals-4 slab, 2-D TWIGL, 2-D IAEA PWR on the stepped quarter core, and
+  2-D BIBLIS full-core PWR); the C5G7 quarter core runs end-to-end in
+  `examples/c5g7_quarter_core.py` (mesh + 7-group transport cross sections +
+  unstructured solver); still to add: a CI-sized C5G7 diffusion regression

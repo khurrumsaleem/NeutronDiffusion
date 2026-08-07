@@ -9,12 +9,19 @@ reports fine-mesh FreeFEM++ reference eigenvalues:
 - 2-D TWIGL seed/blanket quarter core          keff = 0.9133  (Table 4, Fig. 6)
 - 2-D IAEA PWR stepped quarter core            keff = 1.0296  (Table 6, Fig. 12)
 
+plus one full-core benchmark from a different source:
+
+- 2-D BIBLIS full-core PWR (8-composition checkerboard)  keff = 1.02535
+  (FEMFFUSION validation report, Vidal-Ferrandiz et al. 2023; data originally
+  Nakata & Martin, Nucl. Sci. Eng. 85 (1983)).
+
 The model assumes fission neutrons are born fast: chi = (1, 0), with
 down-scatter Sigma_1->2 only.  Removal_g = Sigma_a,g + out-scatter from g.
 
 Each benchmark exercises a different solver: 1-D slab (symmetry at x=0), 2-D
-structured (reflective left/bottom), and 2-D unstructured FVM (the IAEA
-stepped domain is not a rectangle, and uses per-tag Robin BCs).
+structured (reflective left/bottom), and 2-D unstructured FVM (the IAEA stepped
+domain and the BIBLIS full core are not rectangles the structured solver can
+handle - IAEA uses per-tag Robin BCs, BIBLIS a full vacuum boundary).
 """
 
 import numpy as np
@@ -272,4 +279,145 @@ class TestIaea2D:
         assert res.converged
         # h=2.5 gives 1.02943; h=1.25 gives 1.02954 -> extrapolates to the
         # canonical 1.029585.
+        assert abs(res.keff - self.REF_KEFF) < 1e-3, res.keff
+
+
+# ----------------------------------------------------------------------------
+# 2-D BIBLIS full-core PWR (8-composition checkerboard -> unstructured FVM)
+# ----------------------------------------------------------------------------
+
+# From the FEMFFUSION validation report (Vidal-Ferrandiz et al., 2023), Table 4
+# and Fig. 4; cross sections originate in Nakata & Martin, Nucl. Sci. Eng. 85
+# (1983).  257 homogenized assemblies (193 fuel + 64 reflector) of pitch
+# 23.1226 cm on a 17x17 grid whose corners are void; vacuum on the whole outer
+# boundary.  Numbers are taken from the FEMFFUSION input deck (biblis.xsec /
+# biblis_SP1.prm), authoritative where it disagrees with the report's typeset
+# Table 4 (e.g. material 1 Sigma_a2 = 0.0750058, not 0.0750580).
+
+BIBLIS_PITCH = 23.1226  # cm, homogenized assembly width
+
+# Composition per assembly; 0 = void, 1..8 index BIBLIS_XS (composition 3 is the
+# non-fissile reflector).  The loading is symmetric, so row orientation does not
+# affect keff.
+BIBLIS_MAP = [
+    [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0],
+    [0, 0, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 3, 3, 3, 0, 0],
+    [0, 3, 3, 4, 4, 8, 1, 1, 1, 1, 1, 8, 4, 4, 3, 3, 0],
+    [0, 3, 4, 4, 5, 1, 7, 1, 7, 1, 7, 1, 5, 4, 4, 3, 0],
+    [3, 3, 4, 5, 2, 8, 2, 8, 1, 8, 2, 8, 2, 5, 4, 3, 3],
+    [3, 4, 8, 1, 8, 2, 8, 2, 6, 2, 8, 2, 8, 1, 8, 4, 3],
+    [3, 4, 1, 7, 2, 8, 1, 8, 2, 8, 1, 8, 2, 7, 1, 4, 3],
+    [3, 4, 1, 1, 8, 2, 8, 1, 8, 1, 8, 2, 8, 1, 1, 4, 3],
+    [3, 4, 1, 7, 1, 6, 2, 8, 1, 8, 2, 6, 1, 7, 1, 4, 3],
+    [3, 4, 1, 1, 8, 2, 8, 1, 8, 1, 8, 2, 8, 1, 1, 4, 3],
+    [3, 4, 1, 7, 2, 8, 1, 8, 2, 8, 1, 8, 2, 7, 1, 4, 3],
+    [3, 4, 8, 1, 8, 2, 8, 2, 6, 2, 8, 2, 8, 1, 8, 4, 3],
+    [3, 3, 4, 5, 2, 8, 2, 8, 1, 8, 2, 8, 2, 5, 4, 3, 3],
+    [0, 3, 4, 4, 5, 1, 7, 1, 7, 1, 7, 1, 5, 4, 4, 3, 0],
+    [0, 3, 3, 4, 4, 8, 1, 1, 1, 1, 1, 8, 4, 4, 3, 3, 0],
+    [0, 0, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 3, 3, 3, 0, 0],
+    [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0],
+]
+
+# (D1, D2, Sa1, Sa2, S12, nuSf1, nuSf2); D = 1/(3*Sigma_tr).  chi=(1,0) and
+# down-scatter only, as two_group_materials assumes.
+BIBLIS_XS = [
+    (1.436000, 0.363500, 0.0095042, 0.0750058, 0.017754, 0.0058708, 0.096067),
+    (1.436600, 0.363600, 0.0096785, 0.078436,  0.017621, 0.0061908, 0.10358),
+    (1.320000, 0.277200, 0.0026562, 0.071596,  0.023106, 0.0,       0.0),
+    (1.438900, 0.363800, 0.010363,  0.091408,  0.017101, 0.0074527, 0.13236),
+    (1.438100, 0.366500, 0.010003,  0.084828,  0.017290, 0.0061908, 0.10358),
+    (1.438500, 0.366500, 0.010132,  0.087314,  0.017192, 0.0064285, 0.10911),
+    (1.438900, 0.367900, 0.010165,  0.088024,  0.017125, 0.0061908, 0.10358),
+    (1.439300, 0.368000, 0.010294,  0.09051,   0.017027, 0.0064285, 0.10911),
+]
+
+
+def build_biblis_mesh(cells_per_assembly):
+    """Cartesian quad mesh of the full BIBLIS core, cells_per_assembly per side.
+
+    Void map entries are skipped; every exterior edge gets BC tag 0 (a single
+    vacuum boundary - the full core has no symmetry axes to reflect on).  Same
+    vertex-dedup + edge-count boundary extraction as build_iaea_mesh.
+    """
+    n = len(BIBLIS_MAP)
+    h = BIBLIS_PITCH / cells_per_assembly
+    vid = {}
+    vx, vy = [], []
+
+    def vertex(ix, jy):
+        key = (ix, jy)
+        if key not in vid:
+            vid[key] = len(vx)
+            vx.append(ix * h)
+            vy.append(jy * h)
+        return vid[key]
+
+    cell_vertices, cell_offsets, material_id = [], [0], []
+    edge_count = {}
+    for jrow in range(n):
+        for icol in range(n):
+            comp = BIBLIS_MAP[jrow][icol]
+            if comp == 0:
+                continue
+            for dj in range(cells_per_assembly):
+                for di in range(cells_per_assembly):
+                    ix = icol * cells_per_assembly + di
+                    jy = jrow * cells_per_assembly + dj
+                    v = [vertex(ix, jy), vertex(ix + 1, jy),
+                         vertex(ix + 1, jy + 1), vertex(ix, jy + 1)]
+                    cell_vertices.extend(v)
+                    cell_offsets.append(len(cell_vertices))
+                    material_id.append(comp - 1)
+                    for k in range(4):
+                        a, b = v[k], v[(k + 1) % 4]
+                        edge_count[(min(a, b), max(a, b))] = \
+                            edge_count.get((min(a, b), max(a, b)), 0) + 1
+
+    bface_v0, bface_v1, bface_tag = [], [], []
+    for (a, b), count in edge_count.items():
+        if count == 1:
+            bface_v0.append(a)
+            bface_v1.append(b)
+            bface_tag.append(0)
+
+    mesh = nd.UnstructuredMesh2D()
+    mesh.vx, mesh.vy = vx, vy
+    mesh.cell_vertices = cell_vertices
+    mesh.cell_offsets = cell_offsets
+    mesh.material_id = material_id
+    mesh.bface_v0, mesh.bface_v1 = bface_v0, bface_v1
+    mesh.bface_bc_tag = bface_tag
+    return mesh
+
+
+class TestBiblis2D:
+    """2-D BIBLIS full-core PWR benchmark (unstructured FVM, vacuum boundary).
+
+    A diffusion benchmark, so this diffusion solver reproduces the diffusion
+    reference well: FEMFFUSION's mesh-converged SP1 (diffusion) keff is 1.02535
+    (the higher-order Mueller-Weiss benchmark value is 1.02584).  This FVM
+    solution converges toward the diffusion reference from above with mesh
+    refinement: cells_per_assembly 2/4/6/8 give keff
+    1.02865 / 1.02597 / 1.02553 / 1.02540.
+    """
+
+    REF_KEFF = 1.02535  # FEMFFUSION SP1 (diffusion), mesh-converged
+
+    def test_keff(self):
+        # Marshak vacuum on the whole outer boundary, using the reflector D
+        # (composition 3) that borders the exterior.
+        d1_refl, d2_refl = BIBLIS_XS[2][0], BIBLIS_XS[2][1]
+        bc = nd.boundary_conditions([d1_refl, d2_refl], alpha=0.0)
+        solver = nd.KEigenSolverUnstructured2D(
+            mats=two_group_materials(BIBLIS_XS),
+            mesh=build_biblis_mesh(cells_per_assembly=6),
+            bc=bc,
+            epsilon=1e-7,
+            max_outer=2000,
+            max_inner=200,
+            use_cg=True,
+        )
+        res = solver.solve()
+        assert res.converged
         assert abs(res.keff - self.REF_KEFF) < 1e-3, res.keff
