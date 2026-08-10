@@ -13,6 +13,13 @@ Multigroup neutron diffusion solver for 1-D and 2-D geometries. Written in C++17
 - Per-group Thomas (TDMA) tridiagonal solver inside a Gauss-Seidel group sweep
 - Harmonic-mean diffusion coefficients at material interfaces
 
+### Reactor kinetics (all three dimensionalities)
+- **Delayed neutron precursors** - any number of precursor groups, per-material
+  delayed fractions and delayed fission spectra
+- **Implicit fission source**, so backward Euler stays unconditionally stable
+  through a supercritical transient
+- **Mid-transient perturbation** via `update_materials`, for reactivity insertions
+
 ### 2-D structured (Cartesian XY or axisymmetric RZ)
 - Finite-difference 5-point stencil on an nx x ny Cartesian grid
 - Left (x=0) and bottom (y=0) boundaries hardcoded as reflective; right and top boundaries take user-specified Robin BCs per group
@@ -151,6 +158,97 @@ material and returns a plain dict, useful for inspecting the derived `D`,
 
 See `examples/transport_cross_sections.py` for a runnable end-to-end example.
 
+## Reactor kinetics
+
+The time-dependent solvers model delayed neutron precursors:
+
+```
+(1/v_g) dphi_g/dt = -A_g phi_g + scatter
+                  + (1-beta) chi_p,g F + sum_i chi_d,i,g lambda_i C_i
+        dC_i/dt   = beta_i F - lambda_i C_i,   F = sum_g' nuSigf_g' phi_g'
+```
+
+Backward Euler eliminates `C^{n+1}` in closed form, which folds the delayed
+source into a `dt`-dependent **effective fission spectrum** plus a source known
+from the old precursors:
+
+```
+chi_eff,g = (1-beta) chi_p,g + sum_i chi_d,i,g beta_i lambda_i dt / (1 + lambda_i dt)
+Q_d,g     = sum_i chi_d,i,g lambda_i C_i^n / (1 + lambda_i dt)
+```
+
+As `dt -> 0` this tends to `(1-beta) chi_p` (prompt only); as `dt -> inf` it
+tends to the total fission spectrum, so a critical system with equilibrium
+precursors is a fixed point at any step size. Fission is evaluated at the new
+time level inside the Gauss-Seidel sweep, so the scheme stays unconditionally
+stable.
+
+```python
+delayed = nd.make_delayed_data(nd.DELAYED_U235_6GROUP, G=2, n_mat=3, chi=mats.chi)
+
+# Start from a genuine steady state: a k-eigenvalue flux is only stationary
+# once nusigf is divided by keff.
+res = nd.KEigenSolver2D(mats, medium_map, edges_x, edges_y, geom, bc_x, bc_y).solve()
+critical = nd.scale_to_critical(mats, res.keff)
+
+solver = nd.TimeDependentSolver2D(
+    mats=critical, medium_map=medium_map,
+    edges_x=edges_x, edges_y=edges_y, geom=nd.Geometry2D.XY,
+    bc_x=bc_x, bc_y=bc_y, initial_flux=res.flux,
+    delayed=delayed,          # omit for prompt-only kinetics
+)
+solver.update_materials(perturbed)   # step insertion at t = 0
+out = solver.run(dt=2e-3, n_steps=250)
+out.precursors                        # [cells * n_precursor], per unit volume
+```
+
+Precursors default to equilibrium with the initial flux, which is what a
+transient starting from steady state needs; pass `initial_precursors` to
+override. Drive a ramp by calling `update_materials` once per step with
+interpolated cross sections.
+
+`DelayedNeutronData` arrays are flat: `lambda_` is `[n_precursor]`, `beta` is
+`[n_mat * n_precursor]`, `chi_delayed` is `[n_mat * n_precursor * n_groups]`
+(each spectrum must sum to 1), and `chi_prompt` is `[n_mat * n_groups]` or empty.
+
+When `chi_prompt` is omitted it is **derived** rather than defaulted to
+`Materials.chi`:
+
+```
+chi_p = (chi - sum_i beta_i chi_d,i) / (1 - beta)
+```
+
+so the prompt and delayed parts always add back up to the total spectrum, and
+`chi_eff` still tends to `chi` as `dt -> inf` for *any* delayed spectrum. With
+the usual `chi_delayed = chi` this reduces to `chi_p = chi`. Pass `chi_prompt`
+explicitly only if `Materials.chi` is itself the prompt spectrum.
+
+**Fission-matrix mode** is supported. There is no separable spectrum, so the
+split is applied to the matrix: the production cross section is the column sum
+`P[g'] = sum_g F[g][g']` (total neutrons emitted per fission caused by a
+group-`g'` neutron), the delayed yield `beta_i chi_d,i[g] P[g']` is subtracted
+from the tabulated matrix, and the part emitted within the step is added back.
+The two representations agree exactly when the matrix is separable. Note that
+`Materials.chi` is all zeros in this mode, so it cannot serve as the
+`ChiDelayed` fallback - supply one.
+
+**Choosing `dt` and `max_inner`.** An implicit fission source means the inner
+Gauss-Seidel sweep resolves the multiplication as well as the scatter coupling,
+and only the `1/(v_g*dt)` diagonal term keeps that iteration contracting. When
+`1/(v*dt) << Sigma_r` a near-critical problem converges at roughly `k` per
+sweep. The solvers apply **Aitken extrapolation** to that fixed point: the
+convergence ratio is estimated from successive iterate changes and, once it has
+held steady, the iterate jumps to the limit of the geometric series. In the
+worst case tested - exactly critical, zero leakage, `1/(v*dt)` at 3% of
+`Sigma_a` - this cuts the iterations per step from thousands to a few dozen.
+The extrapolation is safeguarded (ratio stability judged against `1 - sigma`,
+and the jump capped relative to `||phi||`) and is self-correcting, since
+convergence is still measured across the sweep. Any step that nonetheless hits
+`max_inner` prints a warning to stderr naming the solver and the residual -
+never trust a transient that warned.
+
+See `examples/kinetics.py` for a runnable end-to-end transient.
+
 ## Boundary conditions
 
 | Type | A | B |
@@ -224,6 +322,7 @@ src/ndiffusion/
   create.py                 make_materials / make_medium_map / boundary_conditions
   transport.py              transport -> diffusion cross-section transform
   adjoint.py                make_adjoint_materials - forward -> adjoint transform
+  kinetics.py               delayed neutron data + critical scaling helpers
   nearby.py                 method of nearby problems (fixed-source & k-eigenvalue)
   mesh.py                   load_gmsh - Gmsh .msh import for unstructured meshes
 
@@ -234,10 +333,13 @@ tests/
   test_2d_k_eigenvalue.py
   test_2d_time_dependent.py
   test_2d_fixed_source.py
+  test_kinetics.py
+  test_benchmarks.py
 
 examples/
   k_eigenvalue.py
   time_dependent.py
+  kinetics.py
   transport_cross_sections.py
   c5g7_quarter_core.py
 ```
@@ -278,8 +380,12 @@ The output is written to `docs/doxygen/html/`.
   (accuracy degrades on skewed meshes)
 
 **Physics**
-- Delayed neutron precursor groups in the time-dependent solver (currently
-  prompt-only), and implicit treatment of the fission source (currently explicit)
+- Second-order time differencing (theta / Crank-Nicolson); backward Euler is
+  first-order, which is what sets the step size in a fast transient
+- Improved quasi-static or adiabatic kinetics, factoring the flux into a point
+  kinetics amplitude and a slowly varying shape
+- Thermal-hydraulic feedback (Doppler / moderator density) driving
+  `update_materials` from the power distribution
 - Sensitivity and perturbation analysis built on the adjoint importance
   function (the adjoint materials transform `make_adjoint_materials` now exists)
 - Depletion coupling - Bateman equations for nuclide inventory evolution
@@ -290,7 +396,9 @@ The output is written to `docs/doxygen/html/`.
   Gauss-Seidel, overridable via `NDIFFUSION_KEIG_CG=1`); extend CG to the
   fixed-source and time-dependent solvers, replacing hand-tuned SOR
 - Power-iteration acceleration (Wielandt shift or Chebyshev extrapolation);
-  CMFD (Coarse Mesh Finite Difference) for unstructured k-eigenvalue convergence
+  CMFD (Coarse Mesh Finite Difference) for unstructured k-eigenvalue convergence.
+  The transient inner iteration already uses Aitken extrapolation
+  (`FissionAccelerator`); the same idea would apply to the k-eigenvalue outer
 - Zero-copy numpy arrays across the pybind11 boundary (fluxes and sources
   currently cross as Python lists)
 - OpenMP parallelism for the spatial sweep loops
@@ -301,3 +409,6 @@ The output is written to `docs/doxygen/html/`.
   2-D BIBLIS full-core PWR); the C5G7 quarter core runs end-to-end in
   `examples/c5g7_quarter_core.py` (mesh + 7-group transport cross sections +
   unstructured solver); still to add: a CI-sized C5G7 diffusion regression
+- The TWIGL kinetics transient (`TestTwiglKinetics`) currently validates against
+  its own static reactivity rather than the benchmark's published power history;
+  digitising that history would turn it into a true published regression
