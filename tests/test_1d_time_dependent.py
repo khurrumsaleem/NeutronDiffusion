@@ -2,8 +2,8 @@
 Pytest suite for TimeDependentSolver.
 
 Physical checks:
-  - Critical system: flux shape is preserved over time (explicit-fission
-    backward-Euler keeps amplitude nearly constant for small dt).
+  - Critical system: flux shape is preserved over time (implicit-fission
+    backward-Euler holds the amplitude of a critical system).
   - Supercritical system (keff > 1): total flux grows over time.
   - Subcritical system (keff < 1): total flux decays over time.
   - API: step(), run(), result(), time, steps properties.
