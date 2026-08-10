@@ -146,8 +146,10 @@ private:
  * @brief 2-D multigroup time-dependent neutron diffusion solver
  *        on a structured Cartesian or RZ mesh.
  *
- * Advances  (1/v_g) dphi_g/dt = -A_g phi_g + fission + scatter
- * using backward Euler time differencing.
+ * Advances  (1/v_g) dphi_g/dt = -A_g phi_g + fission + scatter + delayed
+ * using backward Euler time differencing, with the fission source treated
+ * implicitly and the delayed precursor balance integrated in closed form
+ * (see solver_detail.hpp).  With no delayed data this is prompt-only kinetics.
  *
  * @note `Materials::velocity` must be set (neutron speed per group, cm/s).
  */
@@ -169,6 +171,11 @@ public:
      * @param epsilon Convergence tolerance for each implicit solve.
      * @param max_inner Maximum Gauss-Seidel iterations per time step.
      * @param verbose Print iteration diagnostics if true.
+     * @param delayed Delayed neutron precursor data.  Defaults to empty,
+     *        giving prompt-only kinetics.
+     * @param initial_precursors Starting precursor concentrations per unit
+     *        volume, `[nx*ny * n_precursor]` row-major.  Defaults to
+     *        equilibrium with `initial_flux`.
      */
     TimeDependentSolver2D(
         Materials                      mats,
@@ -181,7 +188,9 @@ public:
         std::vector<double>            initial_flux = {},
         double epsilon   = 1e-6,
         int    max_inner = 50,
-        bool   verbose   = true
+        bool   verbose   = true,
+        DelayedNeutronData             delayed = {},
+        std::vector<double>            initial_precursors = {}
     );
 
     /**
@@ -207,10 +216,24 @@ public:
      */
     TimeDependentResult result() const;
 
+    /**
+     * @brief Replace the cross sections mid-transient and rebuild the operator.
+     *
+     * The perturbation mechanism for reactivity transients: flux and precursor
+     * state are preserved, only the spatial operator and fission data change.
+     * `mats` must keep the same `n_mat` and `n_groups`.
+     *
+     * @param mats New cross-section data, including `velocity`.
+     * @throws std::invalid_argument on validation failure or a changed shape.
+     */
+    void update_materials(Materials mats);
+
     /// @return Total elapsed simulated time in seconds.
     double time()  const { return time_; }
     /// @return Number of time steps completed so far.
     int    steps() const { return steps_; }
+    /// @return Precursor concentrations per unit volume, `[nx*ny * n_precursor]`.
+    const std::vector<double>& precursors() const { return precursors_; }
 
 private:
     Materials                      mats_;
@@ -221,12 +244,24 @@ private:
     double epsilon_;
     int    max_inner_;
     bool   verbose_;
+    DelayedNeutronData             delayed_;
 
     int nx_, ny_, groups_;
     double time_;
     int    steps_;
 
     std::vector<double> phi_;   ///< Internal flux state [groups_ * nx_ * ny_]
+
+    /// Precursor concentrations per unit volume [nx_*ny_ * n_precursor].
+    std::vector<double> precursors_;
+
+    /// Cached effective-fission-spectrum materials and the dt they were built
+    /// for; rebuilt only when dt or the cross sections change.
+    Materials chi_eff_mats_;
+    double    chi_eff_dt_;
+
+    /// True once a non-convergent step has been reported (warn once).
+    bool warned_;
 
     // Base (time-independent) stencil coefficients.
     std::vector<double> a_W_base_, a_E_base_, a_S_base_, a_N_base_, diag_base_;
@@ -236,8 +271,12 @@ private:
     std::vector<double> vol_; ///< Cell volumes [nx_ * ny_]
 
     void solve_step(const std::vector<double>& phi_old,
-                    const std::vector<double>& fis,
+                    const std::vector<double>& qd,
                     double dt);
+
+    void build_bands();
+    void refresh_chi_effective(double dt);
+    void init_precursors(const std::vector<double>& initial_precursors);
 };
 
 // ============================================================================
@@ -412,6 +451,15 @@ private:
  * @brief 2-D multigroup time-dependent neutron diffusion solver
  *        on an unstructured triangular/quadrilateral mesh.
  *
+ * Backward Euler with an implicit fission source and delayed neutron
+ * precursors integrated in closed form (see solver_detail.hpp).  With no
+ * delayed data this is prompt-only kinetics.
+ *
+ * @note The FVM equations are volume-integrated, so the RHS terms carry a
+ *       cell-area factor.  Precursor concentrations and the production rate
+ *       are stored **per unit volume** (unweighted); the area is applied only
+ *       where the delayed source enters the RHS.
+ *
  * @note `Materials::velocity` must be set (neutron speed per group, cm/s).
  */
 class TimeDependentSolverUnstructured2D {
@@ -428,6 +476,11 @@ public:
      * @param epsilon Convergence tolerance for each implicit solve.
      * @param max_inner Maximum Gauss-Seidel iterations per time step.
      * @param verbose Print iteration diagnostics if true.
+     * @param delayed Delayed neutron precursor data.  Defaults to empty,
+     *        giving prompt-only kinetics.
+     * @param initial_precursors Starting precursor concentrations per unit
+     *        volume, `[n_cells * n_precursor]` row-major.  Defaults to
+     *        equilibrium with `initial_flux`.
      */
     TimeDependentSolverUnstructured2D(
         Materials          mats,
@@ -436,7 +489,9 @@ public:
         std::vector<double>            initial_flux = {},
         double epsilon   = 1e-6,
         int    max_inner = 50,
-        bool   verbose   = true
+        bool   verbose   = true,
+        DelayedNeutronData             delayed = {},
+        std::vector<double>            initial_precursors = {}
     );
 
     /**
@@ -462,10 +517,24 @@ public:
      */
     TimeDependentResult result() const;
 
+    /**
+     * @brief Replace the cross sections mid-transient and rebuild the operator.
+     *
+     * The perturbation mechanism for reactivity transients: flux and precursor
+     * state are preserved, only the spatial operator and fission data change.
+     * `mats` must keep the same `n_mat` and `n_groups`.
+     *
+     * @param mats New cross-section data, including `velocity`.
+     * @throws std::invalid_argument on validation failure or a changed shape.
+     */
+    void update_materials(Materials mats);
+
     /// @return Total elapsed simulated time in seconds.
     double time()  const { return time_; }
     /// @return Number of time steps completed so far.
     int    steps() const { return steps_; }
+    /// @return Precursor concentrations per unit volume, `[n_cells * n_precursor]`.
+    const std::vector<double>& precursors() const { return precursors_; }
 
 private:
     Materials                      mats_;
@@ -474,12 +543,24 @@ private:
     double epsilon_;
     int    max_inner_;
     bool   verbose_;
+    DelayedNeutronData             delayed_;
 
     int n_cells_, groups_;
     double time_;
     int    steps_;
 
     std::vector<double> phi_; ///< Internal flux state [groups_ * n_cells_]
+
+    /// Precursor concentrations per unit volume [n_cells_ * n_precursor].
+    std::vector<double> precursors_;
+
+    /// Cached effective-fission-spectrum materials and the dt they were built
+    /// for; rebuilt only when dt or the cross sections change.
+    Materials chi_eff_mats_;
+    double    chi_eff_dt_;
+
+    /// True once a non-convergent step has been reported (warn once).
+    bool warned_;
 
     // Mesh geometry (same fields as KEigenSolverUnstructured2D).
     std::vector<double>            cell_area_, cell_cx_, cell_cy_;
@@ -491,8 +572,10 @@ private:
     void preprocess_mesh();
     void build_diagonals();
     void solve_step(const std::vector<double>& phi_old,
-                    const std::vector<double>& fis,
+                    const std::vector<double>& qd,
                     double dt);
+    void refresh_chi_effective(double dt);
+    void init_precursors(const std::vector<double>& initial_precursors);
 };
 
 // ============================================================================

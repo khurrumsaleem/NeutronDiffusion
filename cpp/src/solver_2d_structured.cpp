@@ -544,7 +544,9 @@ TimeDependentSolver2D::TimeDependentSolver2D(
     std::vector<BoundaryCondition> bc_x,
     std::vector<BoundaryCondition> bc_y,
     std::vector<double>            initial_flux,
-    double epsilon, int max_inner, bool verbose
+    double epsilon, int max_inner, bool verbose,
+    DelayedNeutronData             delayed,
+    std::vector<double>            initial_precursors
 ):
       mats_      (std::move(mats)),
       medium_map_(std::move(medium_map)),
@@ -556,11 +558,14 @@ TimeDependentSolver2D::TimeDependentSolver2D(
       epsilon_   (epsilon),
       max_inner_ (max_inner),
       verbose_   (verbose),
+      delayed_   (std::move(delayed)),
       nx_        (static_cast<int>(edges_x_.size()) - 1),
       ny_        (static_cast<int>(edges_y_.size()) - 1),
       groups_    (mats_.n_groups),
       time_      (0.0),
-      steps_     (0)
+      steps_     (0),
+      chi_eff_dt_(-1.0),
+      warned_    (false)
 {
     if (static_cast<int>(bc_x_.size()) != groups_)
         throw std::invalid_argument("bc_x must have one entry per energy group");
@@ -574,17 +579,12 @@ TimeDependentSolver2D::TimeDependentSolver2D(
     if (static_cast<int>(edges_x_.size()) < 2 || static_cast<int>(edges_y_.size()) < 2)
         throw std::invalid_argument("edges_x and edges_y must each have at least 2 entries");
     validate_materials(mats_);
+    validate_delayed(mats_, delayed_);
     validate_increasing(edges_x_, "edges_x");
     validate_increasing(edges_y_, "edges_y");
     validate_material_ids(medium_map_, mats_.n_mat, "medium_map");
 
-    std::vector<double> sa_x, sa_y;
-    compute_geometry_2d(geom_, edges_x_, edges_y_, nx_, ny_, vol_, sa_x, sa_y);
-    build_coefficients_2d(mats_, medium_map_, edges_x_, edges_y_,
-                          vol_, sa_x, sa_y,
-                          bc_x_, bc_y_, nx_, ny_, groups_,
-                          a_W_base_, a_E_base_, a_S_base_, a_N_base_, diag_base_,
-                          ghost_diag_base_, ghost_lower_base_);
+    build_bands();
 
     const int cells = nx_ * ny_;
     phi_.assign(groups_ * cells, 0.0);
@@ -596,6 +596,63 @@ TimeDependentSolver2D::TimeDependentSolver2D(
             for (int ij = 0; ij < cells; ++ij)
                 phi_[g * cells + ij] = initial_flux[ij * groups_ + g];
     }
+
+    init_precursors(initial_precursors);
+}
+
+// ============================================================================
+// TimeDependentSolver2D - operator and kinetics state helpers
+// ============================================================================
+
+void TimeDependentSolver2D::build_bands() {
+    std::vector<double> sa_x, sa_y;
+    compute_geometry_2d(geom_, edges_x_, edges_y_, nx_, ny_, vol_, sa_x, sa_y);
+    build_coefficients_2d(mats_, medium_map_, edges_x_, edges_y_,
+                          vol_, sa_x, sa_y,
+                          bc_x_, bc_y_, nx_, ny_, groups_,
+                          a_W_base_, a_E_base_, a_S_base_, a_N_base_, diag_base_,
+                          ghost_diag_base_, ghost_lower_base_);
+}
+
+void TimeDependentSolver2D::init_precursors(
+    const std::vector<double>& initial_precursors
+) {
+    const int cells = nx_ * ny_;
+    const int I     = delayed_.n_precursor;
+    if (!initial_precursors.empty()) {
+        if (static_cast<int>(initial_precursors.size()) != cells * I)
+            throw std::invalid_argument(
+                "initial_precursors must have nx*ny * n_precursor elements");
+        precursors_ = initial_precursors;
+        return;
+    }
+    std::vector<double> production;
+    accumulate_production(mats_, medium_map_, groups_, cells, cells,
+                          phi_, production);
+    equilibrium_precursors(delayed_, medium_map_, cells, production,
+                           precursors_);
+}
+
+void TimeDependentSolver2D::refresh_chi_effective(double dt) {
+    if (dt == chi_eff_dt_) return;
+    chi_eff_mats_ = build_chi_effective(mats_, delayed_, dt);
+    chi_eff_dt_   = dt;
+}
+
+void TimeDependentSolver2D::update_materials(Materials mats) {
+    if (mats.n_mat != mats_.n_mat || mats.n_groups != mats_.n_groups)
+        throw std::invalid_argument(
+            "update_materials must not change n_mat or n_groups; the mesh and "
+            "material layout are fixed at construction");
+    if (static_cast<int>(mats.velocity.size()) != groups_)
+        throw std::invalid_argument(
+            "Materials.velocity must have one entry per energy group");
+    validate_materials(mats);
+    validate_delayed(mats, delayed_);
+
+    mats_ = std::move(mats);
+    build_bands();
+    chi_eff_dt_ = -1.0;  // invalidate the cached effective spectrum
 }
 
 // ============================================================================
@@ -604,17 +661,25 @@ TimeDependentSolver2D::TimeDependentSolver2D(
 
 void TimeDependentSolver2D::solve_step(
     const std::vector<double>& phi_old,
-    const std::vector<double>& fis,
+    const std::vector<double>& qd,
     double dt
 ) {
     const int cells = nx_ * ny_;
     const int N_x   = nx_ + 1;
 
     std::vector<double> lower(N_x), diag_g(N_x), upper_g(N_x);
-    std::vector<double> rhs(N_x), phi_x(N_x), tw_c, tw_d, phi_iter;
+    std::vector<double> rhs(N_x), phi_x(N_x), tw_c, tw_d, phi_iter, fis;
+
+    double residual  = 0.0;
+    bool   converged = false;
+    FissionAccelerator accel;
 
     for (int inner = 0; inner < max_inner_; ++inner) {
         phi_iter = phi_;
+
+        // Implicit fission source from the latest iterate.
+        accumulate_fission(chi_eff_mats_, medium_map_, groups_, cells, cells,
+                           /*weight=*/nullptr, phi_, fis);
 
         for (int g = 0; g < groups_; ++g) {
             const double inv_v_dt = 1.0 / (mats_.v(g) * dt);
@@ -630,7 +695,8 @@ void TimeDependentSolver2D::solve_step(
                     upper_g[i] = -a_E_base_[flat];
 
                     double r = inv_v_dt * phi_old[flat]   // time source
-                             + fis[flat];                 // fission (explicit)
+                             + fis[flat]                  // fission (implicit)
+                             + qd [flat];                 // delayed (from C^n)
 
                     for (int gp = 0; gp < groups_; ++gp)
                         if (gp != g)
@@ -659,8 +725,15 @@ void TimeDependentSolver2D::solve_step(
         }
 
         // Relative criterion - the physical flux magnitude can be large.
-        if (rel_l2_diff(phi_, phi_iter) < epsilon_)
-            break;
+        residual = rel_l2_diff(phi_, phi_iter);
+        if (residual < epsilon_) { converged = true; break; }
+
+        accel.accelerate(phi_, phi_iter);
+    }
+
+    if (!converged && !warned_) {
+        warn_step_not_converged("TimeDependentSolver2D", max_inner_, dt, residual);
+        warned_ = true;
     }
 }
 
@@ -668,11 +741,23 @@ void TimeDependentSolver2D::step(double dt) {
     const int cells = nx_ * ny_;
     const std::vector<double> phi_old = phi_;
 
-    std::vector<double> fis;
-    accumulate_fission(mats_, medium_map_, groups_, cells, cells,
-                       /*weight=*/nullptr, phi_old, fis);
+    refresh_chi_effective(dt);
 
-    solve_step(phi_old, fis, dt);
+    // Delayed source from the old precursors - constant over the step.
+    std::vector<double> qd;
+    accumulate_delayed_source(delayed_, medium_map_, groups_, cells, cells, dt,
+                              /*weight=*/nullptr, precursors_, qd);
+
+    solve_step(phi_old, qd, dt);
+
+    // Advance the precursors with the production rate of the new flux.
+    if (!delayed_.empty()) {
+        std::vector<double> production;
+        accumulate_production(mats_, medium_map_, groups_, cells, cells,
+                              phi_, production);
+        update_precursors(delayed_, medium_map_, cells, dt, production,
+                          precursors_);
+    }
 
     time_  += dt;
     steps_ += 1;
@@ -693,7 +778,7 @@ TimeDependentResult TimeDependentSolver2D::result() const {
     const int cells = nx_ * ny_;
     std::vector<double> flux_out;
     pack_flux(phi_, cells, groups_, cells, flux_out);
-    return {flux_out, time_, steps_};
+    return {flux_out, time_, steps_, precursors_};
 }
 
 // ============================================================================

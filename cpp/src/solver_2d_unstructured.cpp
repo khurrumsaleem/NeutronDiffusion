@@ -480,7 +480,9 @@ TimeDependentSolverUnstructured2D::TimeDependentSolverUnstructured2D(
     UnstructuredMesh2D mesh,
     std::vector<BoundaryCondition> bc,
     std::vector<double>            initial_flux,
-    double epsilon, int max_inner, bool verbose
+    double epsilon, int max_inner, bool verbose,
+    DelayedNeutronData             delayed,
+    std::vector<double>            initial_precursors
 ):
       mats_      (std::move(mats)),
       mesh_      (std::move(mesh)),
@@ -488,10 +490,13 @@ TimeDependentSolverUnstructured2D::TimeDependentSolverUnstructured2D(
       epsilon_   (epsilon),
       max_inner_ (max_inner),
       verbose_   (verbose),
+      delayed_   (std::move(delayed)),
       n_cells_   (0),
       groups_    (mats_.n_groups),
       time_      (0.0),
-      steps_     (0)
+      steps_     (0),
+      chi_eff_dt_(-1.0),
+      warned_    (false)
 {
     if (static_cast<int>(mats_.velocity.size()) != groups_)
         throw std::invalid_argument(
@@ -505,6 +510,7 @@ TimeDependentSolverUnstructured2D::TimeDependentSolverUnstructured2D(
     if (static_cast<int>(mesh_.material_id.size()) != n_cells_)
         throw std::invalid_argument("material_id size must equal number of cells");
     validate_materials(mats_);
+    validate_delayed(mats_, delayed_);
     validate_material_ids(mesh_.material_id, mats_.n_mat, "material_id");
     build_diagonals();
 
@@ -517,6 +523,53 @@ TimeDependentSolverUnstructured2D::TimeDependentSolverUnstructured2D(
             for (int c = 0; c < n_cells_; ++c)
                 phi_[g * n_cells_ + c] = initial_flux[c * groups_ + g];
     }
+
+    init_precursors(initial_precursors);
+}
+
+// ============================================================================
+// TimeDependentSolverUnstructured2D - kinetics state helpers
+// ============================================================================
+
+void TimeDependentSolverUnstructured2D::init_precursors(
+    const std::vector<double>& initial_precursors
+) {
+    const int I = delayed_.n_precursor;
+    if (!initial_precursors.empty()) {
+        if (static_cast<int>(initial_precursors.size()) != n_cells_ * I)
+            throw std::invalid_argument(
+                "initial_precursors must have n_cells * n_precursor elements");
+        precursors_ = initial_precursors;
+        return;
+    }
+    // Production rate is per unit volume - no cell-area weight here.
+    std::vector<double> production;
+    accumulate_production(mats_, mesh_.material_id, groups_, n_cells_, n_cells_,
+                          phi_, production);
+    equilibrium_precursors(delayed_, mesh_.material_id, n_cells_, production,
+                           precursors_);
+}
+
+void TimeDependentSolverUnstructured2D::refresh_chi_effective(double dt) {
+    if (dt == chi_eff_dt_) return;
+    chi_eff_mats_ = build_chi_effective(mats_, delayed_, dt);
+    chi_eff_dt_   = dt;
+}
+
+void TimeDependentSolverUnstructured2D::update_materials(Materials mats) {
+    if (mats.n_mat != mats_.n_mat || mats.n_groups != mats_.n_groups)
+        throw std::invalid_argument(
+            "update_materials must not change n_mat or n_groups; the mesh and "
+            "material layout are fixed at construction");
+    if (static_cast<int>(mats.velocity.size()) != groups_)
+        throw std::invalid_argument(
+            "Materials.velocity must have one entry per energy group");
+    validate_materials(mats);
+    validate_delayed(mats, delayed_);
+
+    mats_ = std::move(mats);
+    build_diagonals();
+    chi_eff_dt_ = -1.0;  // invalidate the cached effective spectrum
 }
 
 void TimeDependentSolverUnstructured2D::preprocess_mesh() {
@@ -535,12 +588,21 @@ void TimeDependentSolverUnstructured2D::build_diagonals() {
 
 void TimeDependentSolverUnstructured2D::solve_step(
     const std::vector<double>& phi_old,
-    const std::vector<double>& fis,
+    const std::vector<double>& qd,
     double dt
 ) {
-    std::vector<double> phi_iter;
+    std::vector<double> phi_iter, fis;
+    double residual  = 0.0;
+    bool   converged = false;
+    FissionAccelerator accel;
+
     for (int inner = 0; inner < max_inner_; ++inner) {
         phi_iter = phi_;
+
+        // Implicit fission source from the latest iterate.  The FVM equations
+        // are volume-integrated, so this one carries the cell-area weight.
+        accumulate_fission(chi_eff_mats_, mesh_.material_id, groups_,
+                           n_cells_, n_cells_, &cell_area_, phi_, fis);
 
         for (int c = 0; c < n_cells_; ++c) {
             const int    mat  = mesh_.material_id[c];
@@ -551,7 +613,8 @@ void TimeDependentSolverUnstructured2D::solve_step(
                 const double diag = a_diag_base_[g * n_cells_ + c] + inv_v_dt * area;
 
                 double rhs = inv_v_dt * phi_old[g * n_cells_ + c] * area
-                           + fis[g * n_cells_ + c];
+                           + fis[g * n_cells_ + c]   // fission (implicit)
+                           + qd [g * n_cells_ + c];  // delayed (from C^n)
 
                 for (int gp = 0; gp < groups_; ++gp)
                     if (gp != g)
@@ -572,19 +635,44 @@ void TimeDependentSolverUnstructured2D::solve_step(
         }
 
         // Relative criterion - the physical flux magnitude can be large.
-        if (rel_l2_diff(phi_, phi_iter) < epsilon_)
-            break;
+        residual = rel_l2_diff(phi_, phi_iter);
+        if (residual < epsilon_) { converged = true; break; }
+
+        accel.accelerate(phi_, phi_iter);
+    }
+
+    if (!converged && !warned_) {
+        warn_step_not_converged("TimeDependentSolverUnstructured2D",
+                                max_inner_, dt, residual);
+        warned_ = true;
     }
 }
 
 void TimeDependentSolverUnstructured2D::step(double dt) {
     const std::vector<double> phi_old = phi_;
 
-    std::vector<double> fis;
-    accumulate_fission(mats_, mesh_.material_id, groups_, n_cells_, n_cells_,
-                       &cell_area_, phi_old, fis);
+    refresh_chi_effective(dt);
 
-    solve_step(phi_old, fis, dt);
+    // Delayed source from the old precursors.  Precursors are stored per unit
+    // volume, so the cell area is applied here, where Q_d enters the
+    // volume-integrated FVM right-hand side.
+    std::vector<double> qd;
+    accumulate_delayed_source(delayed_, mesh_.material_id, groups_,
+                              n_cells_, n_cells_, dt, &cell_area_,
+                              precursors_, qd);
+
+    solve_step(phi_old, qd, dt);
+
+    // Advance the precursors from the new flux.  The production rate is a
+    // pointwise quantity - unweighted, unlike the fission source above.
+    if (!delayed_.empty()) {
+        std::vector<double> production;
+        accumulate_production(mats_, mesh_.material_id, groups_,
+                              n_cells_, n_cells_, phi_, production);
+        update_precursors(delayed_, mesh_.material_id, n_cells_, dt,
+                          production, precursors_);
+    }
+
     time_  += dt;
     steps_ += 1;
 
@@ -603,7 +691,7 @@ TimeDependentResult TimeDependentSolverUnstructured2D::run(double dt, int n_step
 TimeDependentResult TimeDependentSolverUnstructured2D::result() const {
     std::vector<double> flux_out;
     pack_flux(phi_, n_cells_, groups_, n_cells_, flux_out);
-    return {flux_out, time_, steps_};
+    return {flux_out, time_, steps_, precursors_};
 }
 
 // ============================================================================
