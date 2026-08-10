@@ -279,5 +279,79 @@ int main() {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // 11. Kinetics: infinite medium with 6 delayed precursor groups
+    //
+    //     Reflective on both sides and a uniform initial flux means no
+    //     leakage, so the problem reduces exactly to point kinetics with
+    //     Lambda = 1/(v*nu_sigf) and rho = 1 - Sigma_a/nu_sigf.  Two checks:
+    //     an unperturbed critical medium with equilibrium precursors must hold
+    //     its amplitude, and a $0.50 step insertion must show the prompt jump
+    //     beta/(beta - rho) = 2 rather than a prompt excursion.
+    // -----------------------------------------------------------------------
+    {
+        const double nu_sigf = 0.1570;
+        const double velocity = 2.2e5;
+
+        // Keepin 6-group U-235 thermal fission data.
+        DelayedNeutronData delayed;
+        delayed.n_precursor = 6;
+        delayed.lambda = {0.0124, 0.0305, 0.111, 0.301, 1.14, 3.01};
+        delayed.beta   = {0.000215, 0.001424, 0.001274,
+                          0.002568, 0.000748, 0.000273};
+        delayed.chi_delayed = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+
+        double beta_total = 0.0;
+        for (double b : delayed.beta) beta_total += b;
+
+        auto medium = [&](double rho) {
+            Materials m;
+            m.n_mat = 1;  m.n_groups = 1;
+            m.D        = {1.0};
+            m.removal  = {nu_sigf * (1.0 - rho)};
+            m.scatter  = {0.0};
+            m.chi      = {1.0};
+            m.nusigf   = {nu_sigf};
+            m.velocity = {velocity};
+            return m;
+        };
+
+        const int cells = 8;
+        const std::vector<double> initial_flux(cells, 1.0);
+        const std::vector<BoundaryCondition> bc = {reflective()};
+
+        std::cout << "\n=== Kinetics: infinite medium, 6 delayed groups ===\n";
+
+        {
+            TimeDependentSolver tds(
+                medium(0.0), uniform_map(cells), linspace(0.0, 10.0, cells + 1),
+                Geometry::Slab, bc, initial_flux, 1e-10, 500, false, delayed
+            );
+            tds.run(1.0, 10);
+            const double amp = tds.result().flux[0];
+            std::cout << "  critical, equilibrium precursors: amplitude = "
+                      << std::setprecision(12) << amp
+                      << (std::fabs(amp - 1.0) < 1e-8 ? "  [OK]" : "  [FAIL]")
+                      << "\n";
+        }
+
+        {
+            const double rho = 0.5 * beta_total;
+            TimeDependentSolver tds(
+                medium(0.0), uniform_map(cells), linspace(0.0, 10.0, cells + 1),
+                Geometry::Slab, bc, initial_flux, 1e-10, 500, false, delayed
+            );
+            tds.update_materials(medium(rho));
+            tds.run(1e-5, 2000);  // 0.02 s
+            const double amp = tds.result().flux[0];
+            const double jump = beta_total / (beta_total - rho);
+            std::cout << "  $0.50 step, t = 0.02 s: amplitude = "
+                      << std::setprecision(6) << amp
+                      << "  (prompt jump " << jump << ")"
+                      << (amp > 1.8 && amp < jump ? "  [OK]" : "  [FAIL]")
+                      << "\n";
+        }
+    }
+
     return 0;
 }
