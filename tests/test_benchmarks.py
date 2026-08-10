@@ -25,6 +25,7 @@ handle - IAEA uses per-tag Robin BCs, BIBLIS a full vacuum boundary).
 """
 
 import numpy as np
+import pytest
 
 import ndiffusion as nd
 
@@ -421,3 +422,156 @@ class TestBiblis2D:
         res = solver.solve()
         assert res.converged
         assert abs(res.keff - self.REF_KEFF) < 1e-3, res.keff
+
+
+# ----------------------------------------------------------------------------
+# 2-D TWIGL kinetics (delayed neutron precursors, step reactivity insertion)
+# ----------------------------------------------------------------------------
+
+
+class TestTwiglKinetics:
+    """TWIGL seed/blanket transient on the geometry of TestTwigl2D.
+
+    Cross sections, delayed data (one precursor group, beta = 0.0075,
+    lambda = 0.08 1/s) and group velocities are the classic TWIGL kinetics set.
+    The seed is split into the two symmetric arms (material 0, perturbed) and
+    the central corner block (material 1); the blanket is material 2.
+
+    This is an internal-consistency validation, **not** a comparison against
+    published TWIGL power histories - the perturbation size here was chosen to
+    give a $0.50 insertion under this code's own static reactivity, rather than
+    copied from the benchmark specification.  What it pins down is the coupling
+    between the spatial solver and the kinetics: the reactivity worth of the
+    perturbation is computed independently from two k-eigenvalue solves, and
+    the transient's prompt jump must match the point-kinetics value
+    beta / (beta - rho) that worth implies.  That relation is independent of
+    the generation time, so it needs no fitted parameter.
+
+    The mesh is coarse (4 cm cells): the time behaviour is what is under test,
+    and TestTwigl2D already covers spatial accuracy at 1 cm.
+    """
+
+    BETA = 0.0075    # total delayed fraction
+    LAMBDA = 0.08    # 1/s, single precursor group
+    V_FAST, V_THERMAL = 1.0e7, 2.0e5  # cm/s
+    DELTA_SA2 = -0.0015  # step change in seed-arm thermal absorption
+    N = 20               # 4 cm cells; region edges 24/56 fall on cell edges
+
+    def materials(self, delta_sa2=0.0):
+        return two_group_materials([
+            # D1   D2   Sa1    Sa2                  S12   nuSf1  nuSf2
+            (1.4, 0.4, 0.010, 0.15 + delta_sa2, 0.01, 0.007, 0.20),  # seed arms
+            (1.4, 0.4, 0.010, 0.15, 0.01, 0.007, 0.20),              # seed corner
+            (1.3, 0.5, 0.008, 0.05, 0.01, 0.003, 0.06),              # blanket
+        ])
+
+    @staticmethod
+    def region(x, y):
+        if (x < 24 and 24 < y < 56) or (y < 24 and 24 < x < 56):
+            return 0  # perturbed seed arms
+        if 24 < x < 56 and 24 < y < 56:
+            return 1  # seed corner
+        return 2      # blanket
+
+    def mesh(self):
+        n, h = self.N, 80.0 / self.N
+        edges = list(np.linspace(0.0, 80.0, n + 1))
+        medium_map = [
+            self.region((i + 0.5) * h, (j + 0.5) * h)
+            for i in range(n) for j in range(n)
+        ]
+        return edges, medium_map
+
+    def keff(self, mats, edges, medium_map):
+        zero_flux = [nd.BoundaryCondition(A=1.0, B=0.0)] * 2
+        solver = nd.KEigenSolver2D(
+            mats=mats, medium_map=medium_map, edges_x=edges, edges_y=edges,
+            geom=nd.Geometry2D.XY, bc_x=zero_flux, bc_y=zero_flux,
+            epsilon=1e-9, max_outer=3000, max_inner=200, use_cg=True,
+        )
+        res = solver.solve()
+        assert res.converged
+        return res.keff, res.flux
+
+    def transient(self, edges, medium_map, initial, delayed, mats):
+        zero_flux = [nd.BoundaryCondition(A=1.0, B=0.0)] * 2
+        kwargs = {} if delayed is None else {"delayed": delayed}
+        return nd.TimeDependentSolver2D(
+            mats=mats, medium_map=medium_map, edges_x=edges, edges_y=edges,
+            geom=nd.Geometry2D.XY, bc_x=zero_flux, bc_y=zero_flux,
+            initial_flux=initial, epsilon=1e-9, max_inner=200, **kwargs,
+        )
+
+    def setup_case(self):
+        """Critical steady state plus the perturbed materials and their worth."""
+        edges, medium_map = self.mesh()
+        k0, flux0 = self.keff(self.materials(), edges, medium_map)
+
+        # Scale by 1/k0 so the eigenvalue flux is an exact steady state; apply
+        # the same scaling to the perturbed set so rho is the perturbation's
+        # worth alone and not contaminated by the criticality offset.
+        critical = nd.scale_to_critical(self.materials(), k0)
+        perturbed = nd.scale_to_critical(self.materials(self.DELTA_SA2), k0)
+
+        k1, _ = self.keff(perturbed, edges, medium_map)
+        rho = (k1 - 1.0) / k1
+
+        delayed = nd.make_delayed_data(
+            {"Beta": [self.BETA], "Lambda": [self.LAMBDA]},
+            G=2, n_mat=3, chi=[1.0, 0.0],
+        )
+        for m in (critical, perturbed):
+            m.velocity = [self.V_FAST, self.V_THERMAL]
+        return edges, medium_map, flux0, critical, perturbed, rho, delayed
+
+    def test_step_insertion(self):
+        (edges, medium_map, flux0, critical, perturbed, rho,
+         delayed) = self.setup_case()
+
+        # The perturbation is a sub-prompt-critical insertion.
+        assert rho / self.BETA == pytest.approx(0.50, abs=0.02)
+
+        # Unperturbed: an exact fixed point, even at 10 ms steps.
+        steady = self.transient(edges, medium_map, flux0, delayed, critical)
+        p0 = float(np.sum(steady.result().flux))
+        steady.run(1e-2, 5)
+        assert float(np.sum(steady.result().flux)) / p0 == pytest.approx(1.0, abs=1e-8)
+
+        # Step insertion at t = 0.
+        solver = self.transient(edges, medium_map, flux0, delayed, critical)
+        solver.update_materials(perturbed)
+
+        solver.run(2e-3, 50)  # t = 0.1 s: prompt jump complete
+        power_jump = float(np.sum(solver.result().flux)) / p0
+        assert power_jump == pytest.approx(self.BETA / (self.BETA - rho), rel=0.02)
+
+        solver.run(2e-3, 200)  # t = 0.5 s
+        power_late = float(np.sum(solver.result().flux)) / p0
+        # Delayed timescale: still climbing, but only by a few percent over the
+        # following 0.4 s - not the orders of magnitude a prompt excursion gives.
+        assert power_late > power_jump
+        assert power_late / power_jump < 1.1
+
+    def test_prompt_only_runs_away(self):
+        """The same insertion without precursors is a prompt excursion.
+
+        This is the defect the delayed treatment fixes, asserted as a
+        same-time comparison: at t = 0.05 s the delayed transient has settled
+        near its prompt jump (~2x), while the prompt-only one is already ~150x
+        and climbing on the ~3.8e-5 s generation time.
+        """
+        (edges, medium_map, flux0, critical, perturbed, _rho,
+         delayed) = self.setup_case()
+
+        powers = {}
+        for label, delayed_data in (("delayed", delayed), ("prompt", None)):
+            solver = self.transient(
+                edges, medium_map, flux0, delayed_data, critical
+            )
+            p0 = float(np.sum(solver.result().flux))
+            solver.update_materials(perturbed)
+            solver.run(5e-4, 100)  # t = 0.05 s
+            powers[label] = float(np.sum(solver.result().flux)) / p0
+
+        assert powers["delayed"] == pytest.approx(2.0, rel=0.05)
+        assert powers["prompt"] / powers["delayed"] > 10.0
