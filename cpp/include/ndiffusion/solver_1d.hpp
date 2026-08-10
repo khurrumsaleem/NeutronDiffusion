@@ -207,22 +207,30 @@ private:
 /**
  * @brief 1-D multigroup time-dependent neutron diffusion solver.
  *
- * Advances the prompt-neutron diffusion equation
+ * Advances the multigroup diffusion equation
  * @code
  *   (1/v_g) dphi_g/dt = -A_g phi_g
- *                    + chi_g * sigma_gp( nu_sigma_f,gp * phi_gp )   [fission]
- *                    + sigma_{gpg} sigma_s(ggp) * phi_gp        [scatter]
+ *                    + sum_{gp!=g} sigma_s(g<-gp) * phi_gp          [scatter]
+ *                    + (1-beta) chi_p,g * F                         [prompt]
+ *                    + sum_i chi_d,i,g * lambda_i * C_i             [delayed]
+ *   dC_i/dt = beta_i * F - lambda_i * C_i,   F = sum_gp nu_sigf_gp phi_gp
  * @endcode
  * using **backward Euler** time differencing.
  *
  * @par Time-stepping algorithm
- * 1. Fission source is computed explicitly from phi^n.
+ * 1. The precursor equation is integrated in closed form, folding the delayed
+ *    source into a dt-dependent effective fission spectrum `chi_eff` plus a
+ *    source `Q_d` known from the old precursors (see solver_detail.hpp).
  * 2. The time-absorption term `1/(v_g * dt)` is added to the spatial
  *    diagonal, so the modified per-group system is still tridiagonal.
- * 3. A Gauss-Seidel sweep over groups solves the implicit scatter coupling.
+ * 3. A Gauss-Seidel sweep over groups resolves the implicit scatter coupling
+ *    **and** the implicit fission source.
+ * 4. The precursors are advanced from the converged new flux.
  *
- * This scheme is unconditionally stable for the diffusion operator and
+ * Fission is treated implicitly, so the scheme is unconditionally stable and
  * first-order accurate in time.  Use small dt for physical accuracy.
+ *
+ * With no delayed data (the default) this reduces to prompt-only kinetics.
  *
  * @par Requirements
  * `Materials::velocity` must be set (size = n_groups) before constructing
@@ -231,7 +239,7 @@ private:
  * @par Usage
  * @code
  *   TimeDependentSolver tds(mats, medium_map, edges_x, geom, bc,
- *                           initial_flux);
+ *                           initial_flux, 1e-6, 50, false, delayed);
  *   for (int n = 0; n < n_steps; ++n)
  *       tds.step(dt);
  *   TimeDependentResult res = tds.result();
@@ -252,10 +260,18 @@ public:
      * @param epsilon       Convergence tolerance for the Gauss-Seidel inner loop.
      * @param max_inner     Maximum Gauss-Seidel inner iterations per time step.
      * @param verbose       Print step diagnostics if true.
+     * @param delayed       Delayed neutron precursor data.  Defaults to empty,
+     *                      giving prompt-only kinetics.
+     * @param initial_precursors Starting precursor concentrations per unit
+     *                      volume, `[cells * n_precursor]` row-major.  Defaults
+     *                      to equilibrium with `initial_flux`, the right choice
+     *                      when the transient starts from a steady state.
      *
      * @throws std::invalid_argument if `bc.size() != mats.n_groups`,
-     *         `mats.velocity.size() != mats.n_groups`, or
-     *         `initial_flux.size() != cells * n_groups` (when non-empty).
+     *         `mats.velocity.size() != mats.n_groups`,
+     *         `initial_flux.size() != cells * n_groups` (when non-empty),
+     *         the delayed data is inconsistent with `mats`, or
+     *         `initial_precursors.size() != cells * n_precursor` (when non-empty).
      */
     TimeDependentSolver(
         Materials                      mats,
@@ -266,7 +282,9 @@ public:
         std::vector<double>            initial_flux = {},
         double epsilon   = 1e-6,
         int    max_inner = 50,
-        bool   verbose   = false
+        bool   verbose   = false,
+        DelayedNeutronData             delayed = {},
+        std::vector<double>            initial_precursors = {}
     );
 
     /**
@@ -299,10 +317,29 @@ public:
      */
     TimeDependentResult result() const;
 
+    /**
+     * @brief Replace the cross sections mid-transient and rebuild the operator.
+     *
+     * This is the perturbation mechanism for reactivity transients: the flux and
+     * precursor state are preserved, only the spatial operator and fission data
+     * change.  Drive a ramp by calling this once per step with interpolated
+     * cross sections.
+     *
+     * The mesh, geometry, boundary conditions, and material layout are fixed at
+     * construction, so `mats` must keep the same `n_mat` and `n_groups`.
+     *
+     * @param mats New cross-section data, including `velocity`.
+     * @throws std::invalid_argument if the new materials fail validation, change
+     *         `n_mat` or `n_groups`, or are inconsistent with the delayed data.
+     */
+    void update_materials(Materials mats);
+
     /// @return Total elapsed simulated time in seconds.
     double time()  const { return time_; }
     /// @return Number of time steps taken so far.
     int    steps() const { return steps_; }
+    /// @return Precursor concentrations per unit volume, `[cells * n_precursor]`.
+    const std::vector<double>& precursors() const { return precursors_; }
 
 private:
     Materials                      mats_;
@@ -315,6 +352,7 @@ private:
     double epsilon_;
     int    max_inner_;
     bool   verbose_;
+    DelayedNeutronData             delayed_;
 
     int cells_;
     int groups_;
@@ -328,6 +366,22 @@ private:
     /// Internal flux state [groups_ * N_], ghost row included.
     std::vector<double> phi_;
 
+    /// Precursor concentrations per unit volume [cells_ * n_precursor].
+    std::vector<double> precursors_;
+
+    /// Cached effective-fission-spectrum materials and the dt they were built
+    /// for; rebuilt only when dt or the cross sections change.
+    Materials chi_eff_mats_;
+    double    chi_eff_dt_;
+
+    /// True once a non-convergent step has been reported (warn once per solver).
+    bool warned_;
+
     double time_;   ///< Elapsed simulated time (s)
     int    steps_;  ///< Number of steps taken
+
+    /// Rebuild `chi_eff_mats_` if `dt` differs from the cached value.
+    void refresh_chi_effective(double dt);
+    /// Seed `precursors_` from `initial_precursors`, or from equilibrium.
+    void init_precursors(const std::vector<double>& initial_precursors);
 };

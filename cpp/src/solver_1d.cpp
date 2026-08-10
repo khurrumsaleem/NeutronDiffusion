@@ -364,7 +364,9 @@ TimeDependentSolver::TimeDependentSolver(
     std::vector<double>            initial_flux,
     double epsilon,
     int    max_inner,
-    bool   verbose
+    bool   verbose,
+    DelayedNeutronData             delayed,
+    std::vector<double>            initial_precursors
 ):
       mats_      (std::move(mats)),
       medium_map_(std::move(medium_map)),
@@ -374,9 +376,12 @@ TimeDependentSolver::TimeDependentSolver(
       epsilon_   (epsilon),
       max_inner_ (max_inner),
       verbose_   (verbose),
+      delayed_   (std::move(delayed)),
       cells_     (static_cast<int>(medium_map_.size())),
       groups_    (mats_.n_groups),
       N_         (cells_ + 1),
+      chi_eff_dt_(-1.0),
+      warned_    (false),
       time_      (0.0),
       steps_     (0)
 {
@@ -391,6 +396,7 @@ TimeDependentSolver::TimeDependentSolver(
     if (static_cast<int>(edges_x_.size()) != cells_ + 1)
         throw std::invalid_argument("edges_x must have cells + 1 entries");
     validate_materials(mats_);
+    validate_delayed(mats_, delayed_);
     validate_increasing(edges_x_, "edges_x");
     validate_material_ids(medium_map_, mats_.n_mat, "medium_map");
 
@@ -408,6 +414,57 @@ TimeDependentSolver::TimeDependentSolver(
                 "initial_flux must have cells * n_groups elements");
         unpack_flux(initial_flux, cells_, groups_, N_, /*weight=*/nullptr, phi_);
     }
+
+    init_precursors(initial_precursors);
+}
+
+// ============================================================================
+// TimeDependentSolver - kinetics state helpers
+// ============================================================================
+
+void TimeDependentSolver::init_precursors(
+    const std::vector<double>& initial_precursors
+) {
+    const int I = delayed_.n_precursor;
+    if (!initial_precursors.empty()) {
+        if (static_cast<int>(initial_precursors.size()) != cells_ * I)
+            throw std::invalid_argument(
+                "initial_precursors must have cells * n_precursor elements");
+        precursors_ = initial_precursors;
+        return;
+    }
+    // Default: equilibrium with the initial flux.  Zeros would inject a
+    // spurious prompt drop when starting from a steady state.
+    std::vector<double> production;
+    accumulate_production(mats_, medium_map_, groups_, cells_, N_,
+                          phi_, production);
+    equilibrium_precursors(delayed_, medium_map_, cells_, production,
+                           precursors_);
+}
+
+void TimeDependentSolver::refresh_chi_effective(double dt) {
+    if (dt == chi_eff_dt_) return;
+    chi_eff_mats_ = build_chi_effective(mats_, delayed_, dt);
+    chi_eff_dt_   = dt;
+}
+
+void TimeDependentSolver::update_materials(Materials mats) {
+    if (mats.n_mat != mats_.n_mat || mats.n_groups != mats_.n_groups)
+        throw std::invalid_argument(
+            "update_materials must not change n_mat or n_groups; the mesh and "
+            "material layout are fixed at construction");
+    if (static_cast<int>(mats.velocity.size()) != groups_)
+        throw std::invalid_argument(
+            "Materials.velocity must have one entry per energy group");
+    validate_materials(mats);
+    validate_delayed(mats, delayed_);
+
+    mats_ = std::move(mats);
+    build_tridiagonals(mats_, medium_map_, edges_x_,
+                       surface_area_, volume_, bc_,
+                       cells_, groups_, N_,
+                       lower_base_, diag_base_, upper_base_);
+    chi_eff_dt_ = -1.0;  // invalidate the cached effective spectrum
 }
 
 // ============================================================================
@@ -418,8 +475,15 @@ TimeDependentSolver::TimeDependentSolver(
 //
 //   [A_g + (1/v_g*dt) I] phi_g^{n+1}
 //     = (1/v_g*dt) phi_g^n
-//       + chi_g * sum_gp( nu_sigf_gp * phi_gp^n )    [fission, explicit]
-//       + sum_{gp!=g} sig_s(g<-gp) * phi_gp^{n+1}    [scatter, implicit GS]
+//       + chi_eff,g * sum_gp( nu_sigf_gp * phi_gp^{n+1} )  [fission, implicit]
+//       + Q_d,g                                            [delayed, from C^n]
+//       + sum_{gp!=g} sig_s(g<-gp) * phi_gp^{n+1}          [scatter, implicit GS]
+//
+// chi_eff and Q_d come from integrating the precursor balance in closed form
+// (see solver_detail.hpp); with no delayed data chi_eff is just chi and Q_d is
+// zero, leaving prompt-only kinetics.  Because fission is implicit, it is
+// reassembled from the latest iterate inside the Gauss-Seidel loop, exactly
+// like the cross-group scatter term.
 //
 // The 1/(v_g*dt) term is added to the spatial diagonal at the start of
 // each step; the base tridiagonals are left unchanged for reuse.
@@ -427,17 +491,27 @@ TimeDependentSolver::TimeDependentSolver(
 void TimeDependentSolver::step(double dt) {
     const std::vector<double> phi_old = phi_;
 
-    // Explicit fission source from phi_old:  fis[g*N+i] = chi_g * sum_gp(nusigf*phi_old)
-    std::vector<double> fis;
-    accumulate_fission(mats_, medium_map_, groups_, cells_, N_,
-                       /*weight=*/nullptr, phi_old, fis);
+    refresh_chi_effective(dt);
+
+    // Delayed source from the old precursors - constant over the step.
+    std::vector<double> qd;
+    accumulate_delayed_source(delayed_, medium_map_, groups_, cells_, N_, dt,
+                              /*weight=*/nullptr, precursors_, qd);
 
     // Gauss-Seidel inner iteration
     std::vector<double> lower_g(N_), diag_g(N_), upper_g(N_), rhs(N_), phi_g(N_);
-    std::vector<double> tw_c, tw_d, phi_iter;
+    std::vector<double> tw_c, tw_d, phi_iter, fis;
+
+    double residual  = 0.0;
+    bool   converged = false;
+    FissionAccelerator accel;
 
     for (int inner = 0; inner < max_inner_; ++inner) {
         phi_iter = phi_;
+
+        // Implicit fission source from the latest iterate.
+        accumulate_fission(chi_eff_mats_, medium_map_, groups_, cells_, N_,
+                           /*weight=*/nullptr, phi_, fis);
 
         for (int g = 0; g < groups_; ++g) {
             const double inv_v_dt = 1.0 / (mats_.v(g) * dt);
@@ -446,7 +520,8 @@ void TimeDependentSolver::step(double dt) {
             for (int i = 0; i < cells_; ++i) {
                 const int mat = medium_map_[i];
                 rhs[i] = inv_v_dt * phi_old[g * N_ + i]  // time-source
-                        + fis[g * N_ + i];                // fission (explicit)
+                        + fis[g * N_ + i]                 // fission (implicit)
+                        + qd [g * N_ + i];                // delayed (from C^n)
                 // In-scatter from other groups (latest iterate)
                 for (int gp = 0; gp < groups_; ++gp) {
                     if (gp != g)
@@ -471,8 +546,24 @@ void TimeDependentSolver::step(double dt) {
         }
 
         // Check inner convergence (relative - physical flux can be large)
-        if (rel_l2_diff(phi_, phi_iter) < epsilon_)
-            break;
+        residual = rel_l2_diff(phi_, phi_iter);
+        if (residual < epsilon_) { converged = true; break; }
+
+        accel.accelerate(phi_, phi_iter);
+    }
+
+    if (!converged && !warned_) {
+        warn_step_not_converged("TimeDependentSolver", max_inner_, dt, residual);
+        warned_ = true;
+    }
+
+    // Advance the precursors with the production rate of the new flux.
+    if (!delayed_.empty()) {
+        std::vector<double> production;
+        accumulate_production(mats_, medium_map_, groups_, cells_, N_,
+                              phi_, production);
+        update_precursors(delayed_, medium_map_, cells_, dt, production,
+                          precursors_);
     }
 
     time_  += dt;
@@ -501,5 +592,5 @@ TimeDependentResult TimeDependentSolver::run(double dt, int n_steps) {
 TimeDependentResult TimeDependentSolver::result() const {
     std::vector<double> flux_out;
     pack_flux(phi_, cells_, groups_, N_, flux_out);
-    return {flux_out, time_, steps_};
+    return {flux_out, time_, steps_, precursors_};
 }
