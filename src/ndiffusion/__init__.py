@@ -1,5 +1,6 @@
 from ndiffusion._core import (
     BoundaryCondition,
+    DelayedNeutronData,
     DiffusionResult,
     FixedSourceResult,
     FixedSourceSolver,
@@ -19,6 +20,11 @@ from ndiffusion._core import (
 )
 from ndiffusion.adjoint import make_adjoint_materials
 from ndiffusion.create import boundary_conditions, make_materials, make_medium_map
+from ndiffusion.kinetics import (
+    DELAYED_U235_6GROUP,
+    make_delayed_data,
+    scale_to_critical,
+)
 from ndiffusion.mesh import load_gmsh
 from ndiffusion.nearby import (
     NearbyFixedResult,
@@ -43,6 +49,11 @@ __all__ = [
     "KEigenSolver",
     "FixedSourceSolver",
     "TimeDependentSolver",
+    # kinetics
+    "DelayedNeutronData",
+    "make_delayed_data",
+    "scale_to_critical",
+    "DELAYED_U235_6GROUP",
     # 2-D structured
     "Geometry2D",
     "KEigenSolver2D",
