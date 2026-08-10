@@ -163,6 +163,470 @@ inline void accumulate_fission(const Materials& mats,
 }
 
 // ============================================================================
+// Delayed neutron precursors
+// ============================================================================
+//
+// Backward Euler applied to the precursor balance
+//
+//     dC_i/dt = beta_i * F - lambda_i * C_i,
+//     F(r) = sum_g' nu_sigf_g' phi_g'      (production rate per unit volume)
+//
+// eliminates C^{n+1} in closed form:
+//
+//     C_i^{n+1} = (C_i^n + dt * beta_i * F^{n+1}) / (1 + lambda_i * dt).
+//
+// Substituting that into the delayed source sum_i chi_d,i,g lambda_i C_i^{n+1}
+// splits it into a term proportional to the (implicit) production rate and a
+// term known from the old precursors:
+//
+//     S_g^{n+1} = chi_eff,g(m, dt) * F^{n+1} + Q_d,g,
+//
+//     chi_eff,g = (1 - beta_m) chi_p,g
+//               + sum_i chi_d,i,g * beta_i * lambda_i * dt / (1 + lambda_i dt),
+//     Q_d,g     = sum_i chi_d,i,g * lambda_i * C_i^n / (1 + lambda_i dt).
+//
+// chi_eff has exactly the layout of Materials::chi, so the fission source is
+// still assembled by accumulate_fission() against a shadow Materials.  The two
+// limits are worth remembering: dt -> 0 gives chi_eff -> (1-beta) chi_p (prompt
+// only), and dt -> inf gives chi_eff -> (1-beta) chi_p + sum_i beta_i chi_d,i,
+// the total fission spectrum - so a critical system with equilibrium precursors
+// is a fixed point at any step size.
+
+/// Total fission neutron production per unit flux in group `g_from`, for
+/// material `m`.
+///
+/// In standard mode this is just `nu_sigf(m, g_from)`.  In fission-matrix mode
+/// the fission spectrum is folded into `nusigf`, so the production rate is the
+/// **column sum** `sum_g_to F[g_to][g_from]` - the total number of neutrons
+/// emitted per fission caused by a group-`g_from` neutron.  The two agree when
+/// the matrix is separable, since `sum_g chi_g = 1`.
+inline double production_xs(const Materials& mats, int m, int g_from) {
+    if (!mats.use_fission_matrix()) return mats.nu_sigf(m, g_from);
+    double s = 0.0;
+    for (int g = 0; g < mats.n_groups; ++g)
+        s += mats.nu_sigf_mat(m, g, g_from);
+    return s;
+}
+
+/// The prompt fission spectrum to use for material `m`, group `g`.
+///
+/// An explicit `chi_prompt` wins.  Otherwise it is *derived* from the total
+/// spectrum so that prompt and delayed parts sum back to it:
+///
+///     chi_p = (chi - sum_i beta_i chi_d,i) / (1 - beta)
+///
+/// That keeps `chi_eff(dt -> infinity)` equal to the total spectrum for **any**
+/// delayed spectrum, which is what makes a critical system a fixed point at any
+/// step size.  When `chi_delayed` equals `chi` (the usual default) this reduces
+/// to `chi_p = chi`, so the common case is unchanged.
+inline double prompt_chi(const Materials& mats, const DelayedNeutronData& delayed,
+                         int m, int g) {
+    const int G = mats.n_groups;
+    if (!delayed.chi_prompt.empty()) return delayed.chi_prompt[m * G + g];
+
+    const double beta = delayed.beta_total(m);
+    double delayed_part = 0.0;
+    for (int i = 0; i < delayed.n_precursor; ++i)
+        delayed_part += delayed.bet(m, i) * delayed.chi_d(m, i, g, G);
+    return (mats.chi[m * G + g] - delayed_part) / (1.0 - beta);
+}
+
+/// Throw std::invalid_argument unless the delayed neutron data is consistent
+/// with `mats` and physically sensible.  A default-constructed (empty) instance
+/// always passes: it simply disables delayed neutrons.
+inline void validate_delayed(const Materials& mats,
+                             const DelayedNeutronData& delayed) {
+    if (delayed.empty()) {
+        // n_precursor == 0 must not carry stray data - that is a sizing mistake.
+        if (!delayed.lambda.empty() || !delayed.beta.empty() ||
+            !delayed.chi_delayed.empty())
+            throw std::invalid_argument(
+                "DelayedNeutronData.n_precursor is 0 but lambda/beta/chi_delayed "
+                "are not empty; set n_precursor to enable delayed neutrons");
+        return;
+    }
+    if (delayed.n_precursor < 0)
+        throw std::invalid_argument(
+            "DelayedNeutronData.n_precursor must not be negative");
+
+    const int I = delayed.n_precursor;
+    const int M = mats.n_mat;
+    const int G = mats.n_groups;
+
+    auto check = [](std::size_t actual, std::size_t expected, const char* name,
+                    const char* layout) {
+        if (actual != expected)
+            throw std::invalid_argument(
+                std::string("DelayedNeutronData.") + name + " must have " +
+                layout + " elements (got " + std::to_string(actual) +
+                ", expected " + std::to_string(expected) + ")");
+    };
+    check(delayed.lambda.size(), static_cast<std::size_t>(I),
+          "lambda", "n_precursor");
+    check(delayed.beta.size(), static_cast<std::size_t>(M) * I,
+          "beta", "n_mat * n_precursor");
+    check(delayed.chi_delayed.size(), static_cast<std::size_t>(M) * I * G,
+          "chi_delayed", "n_mat * n_precursor * n_groups");
+    if (!delayed.chi_prompt.empty())
+        check(delayed.chi_prompt.size(), static_cast<std::size_t>(M) * G,
+              "chi_prompt", "n_mat * n_groups (or empty to use Materials.chi)");
+
+    for (int i = 0; i < I; ++i)
+        if (!(delayed.lam(i) > 0.0))
+            throw std::invalid_argument(
+                "DelayedNeutronData.lambda entries must be positive "
+                "(a zero decay constant is a precursor that never decays)");
+
+    for (int m = 0; m < M; ++m) {
+        for (int i = 0; i < I; ++i)
+            if (delayed.bet(m, i) < 0.0)
+                throw std::invalid_argument(
+                    "DelayedNeutronData.beta entries must not be negative");
+        const double b = delayed.beta_total(m);
+        if (b >= 1.0)
+            throw std::invalid_argument(
+                "DelayedNeutronData.beta sums to " + std::to_string(b) +
+                " for material " + std::to_string(m) +
+                "; the total delayed fraction must be below 1");
+    }
+
+    // A decaying precursor emits exactly one neutron, so each delayed spectrum
+    // must be normalised.  This also catches the fission-matrix trap of
+    // defaulting chi_delayed to Materials.chi, which is all zeros in that mode.
+    for (int m = 0; m < M; ++m)
+        for (int i = 0; i < I; ++i) {
+            double s = 0.0;
+            for (int g = 0; g < G; ++g) s += delayed.chi_d(m, i, g, G);
+            if (std::fabs(s - 1.0) > 1e-6)
+                throw std::invalid_argument(
+                    "DelayedNeutronData.chi_delayed for material " +
+                    std::to_string(m) + ", precursor group " + std::to_string(i) +
+                    " sums to " + std::to_string(s) +
+                    "; each delayed spectrum must sum to 1 (in fission-matrix "
+                    "mode it cannot be defaulted from Materials.chi, which is "
+                    "all zeros there - supply ChiDelayed explicitly)");
+        }
+
+    // In standard mode the prompt spectrum is derived by subtracting the
+    // delayed part from the total; a delayed spectrum that overshoots the total
+    // in some group would make it negative, which is unphysical and would show
+    // up much later as a strange transient.  (Fission-matrix mode subtracts the
+    // delayed part from the fission matrix instead - checked in
+    // build_chi_effective, which has the matrix to hand.)
+    if (!mats.use_fission_matrix() && delayed.chi_prompt.empty()) {
+        for (int m = 0; m < M; ++m)
+            for (int g = 0; g < G; ++g)
+                if (prompt_chi(mats, delayed, m, g) < -1e-12)
+                    throw std::invalid_argument(
+                        "the delayed spectrum exceeds the total fission spectrum "
+                        "in material " + std::to_string(m) + ", group " +
+                        std::to_string(g) + ": the derived prompt spectrum "
+                        "(chi - sum_i beta_i chi_d,i) / (1 - beta) is negative. "
+                        "Supply chi_prompt explicitly if Materials.chi is meant "
+                        "to be the prompt spectrum rather than the total");
+    }
+}
+
+/// Build the dt-dependent effective fission operator, returned as a copy of
+/// `mats`.  Handing the result to accumulate_fission() yields the implicit part
+/// of the fission source.
+///
+/// In standard mode `chi` is replaced by
+///
+///     chi_eff,g = (1-beta) chi_p,g
+///               + sum_i chi_d,i,g beta_i lambda_i dt / (1 + lambda_i dt).
+///
+/// In fission-matrix mode there is no separable spectrum, so the same weighting
+/// is applied to the matrix itself.  The delayed part of `F` is `beta_i *
+/// chi_d,i[g_to] * production_xs(g_from)`, so
+///
+///     F_eff[g][g'] = F[g][g'] - sum_i beta_i chi_d,i[g] P[g']
+///                             + sum_i chi_d,i[g] beta_i lam_i dt/(1+lam_i dt) P[g']
+///
+/// where the first correction removes the delayed neutrons from the (total)
+/// tabulated matrix and the second adds back the portion emitted within this
+/// step.  The result is still matrix-shaped with `chi` all zeros, so it stays
+/// in fission-matrix mode.  The two branches agree exactly when the matrix is
+/// separable.
+///
+/// With no delayed data this is just `mats` unchanged, so callers need no
+/// special case for prompt-only problems.
+inline Materials build_chi_effective(const Materials& mats,
+                                     const DelayedNeutronData& delayed,
+                                     double dt) {
+    Materials eff = mats;
+    if (delayed.empty()) return eff;
+
+    const int I = delayed.n_precursor;
+    const int G = mats.n_groups;
+
+    // Weight of precursor group i's neutrons emitted during a step of length dt.
+    auto emitted = [&](int i) {
+        const double lam = delayed.lam(i);
+        return lam * dt / (1.0 + lam * dt);
+    };
+
+    if (!mats.use_fission_matrix()) {
+        for (int m = 0; m < mats.n_mat; ++m) {
+            const double beta = delayed.beta_total(m);
+            for (int g = 0; g < G; ++g) {
+                double c = (1.0 - beta) * prompt_chi(mats, delayed, m, g);
+                for (int i = 0; i < I; ++i)
+                    c += delayed.chi_d(m, i, g, G) * delayed.bet(m, i) * emitted(i);
+                eff.chi[m * G + g] = c;
+            }
+        }
+        return eff;
+    }
+
+    for (int m = 0; m < mats.n_mat; ++m) {
+        for (int gf = 0; gf < G; ++gf) {
+            const double prod = production_xs(mats, m, gf);
+            for (int gt = 0; gt < G; ++gt) {
+                double delayed_share = 0.0;   // removed from the total matrix
+                double delayed_now   = 0.0;   // re-emitted within this step
+                for (int i = 0; i < I; ++i) {
+                    const double w = delayed.bet(m, i) *
+                                     delayed.chi_d(m, i, gt, G) * prod;
+                    delayed_share += w;
+                    delayed_now   += w * emitted(i);
+                }
+                const double f = mats.nu_sigf_mat(m, gt, gf);
+                if (f - delayed_share < -1e-12 * (std::fabs(f) + 1.0))
+                    throw std::invalid_argument(
+                        "the delayed neutron yield exceeds the tabulated fission "
+                        "matrix in material " + std::to_string(m) + ", entry [" +
+                        std::to_string(gt) + "][" + std::to_string(gf) +
+                        "]: nusigf is treated as the *total* fission matrix, so "
+                        "beta_i * chi_d,i must fit inside it");
+                eff.nusigf[(m * G + gt) * G + gf] =
+                    f - delayed_share + delayed_now;
+            }
+        }
+    }
+    return eff;
+}
+
+/// Fission neutron production rate `F[c] = sum_g' P_g' phi[g'*stride+c]`,
+/// **per unit volume** - never area/volume weighted, because the precursor
+/// balance is a pointwise ODE.  Output is indexed by cell, not by group.
+///
+/// `P` is `production_xs`, so this is correct in both fission representations.
+inline void accumulate_production(const Materials& mats,
+                                  const std::vector<int>& material_id,
+                                  int groups, int cells, int stride,
+                                  const std::vector<double>& phi,
+                                  std::vector<double>& out) {
+    out.assign(static_cast<std::size_t>(cells), 0.0);
+
+    // Cache the per-material production cross sections: in fission-matrix mode
+    // each one is a column sum over groups, and this is called every step.
+    std::vector<double> prod(static_cast<std::size_t>(mats.n_mat) * groups);
+    for (int m = 0; m < mats.n_mat; ++m)
+        for (int g = 0; g < groups; ++g)
+            prod[m * groups + g] = production_xs(mats, m, g);
+
+    for (int c = 0; c < cells; ++c) {
+        const int mat = material_id[c];
+        double f = 0.0;
+        for (int gp = 0; gp < groups; ++gp)
+            f += prod[mat * groups + gp] * phi[gp * stride + c];
+        out[c] = f;
+    }
+}
+
+/// Assemble the known delayed source `Q_d[g*stride+c]` from the old precursor
+/// concentrations, in the solvers' internal flux layout.  Each cell is
+/// optionally scaled by `weight[c]` (cell area for the volume-integrated FVM
+/// solver; `nullptr` for the per-unit-volume finite-difference solvers).
+inline void accumulate_delayed_source(const DelayedNeutronData& delayed,
+                                      const std::vector<int>& material_id,
+                                      int groups, int cells, int stride,
+                                      double dt,
+                                      const std::vector<double>* weight,
+                                      const std::vector<double>& precursors,
+                                      std::vector<double>& out) {
+    out.assign(static_cast<std::size_t>(groups) * stride, 0.0);
+    if (delayed.empty()) return;
+
+    const int I = delayed.n_precursor;
+    for (int c = 0; c < cells; ++c) {
+        const int    mat = material_id[c];
+        const double w   = weight ? (*weight)[c] : 1.0;
+        for (int g = 0; g < groups; ++g) {
+            double q = 0.0;
+            for (int i = 0; i < I; ++i) {
+                const double lam = delayed.lam(i);
+                q += delayed.chi_d(mat, i, g, groups) * lam *
+                     precursors[c * I + i] / (1.0 + lam * dt);
+            }
+            out[g * stride + c] = q * w;
+        }
+    }
+}
+
+/// Advance the precursors in place with the closed-form backward-Euler update,
+/// using the production rate of the just-computed flux.
+inline void update_precursors(const DelayedNeutronData& delayed,
+                              const std::vector<int>& material_id,
+                              int cells, double dt,
+                              const std::vector<double>& production,
+                              std::vector<double>& precursors) {
+    if (delayed.empty()) return;
+    const int I = delayed.n_precursor;
+    for (int c = 0; c < cells; ++c) {
+        const int mat = material_id[c];
+        for (int i = 0; i < I; ++i) {
+            const double lam = delayed.lam(i);
+            precursors[c * I + i] =
+                (precursors[c * I + i] + dt * delayed.bet(mat, i) * production[c])
+                / (1.0 + lam * dt);
+        }
+    }
+}
+
+/// Equilibrium precursor concentrations `C_i = beta_i * F / lambda_i` for a
+/// given production rate - the steady state of the precursor balance, and the
+/// right default when a transient starts from a converged steady-state flux.
+/// Seeding zeros instead would inject a large spurious prompt drop at t = 0.
+inline void equilibrium_precursors(const DelayedNeutronData& delayed,
+                                   const std::vector<int>& material_id,
+                                   int cells,
+                                   const std::vector<double>& production,
+                                   std::vector<double>& out) {
+    const int I = delayed.n_precursor;
+    out.assign(static_cast<std::size_t>(cells) * (I > 0 ? I : 0), 0.0);
+    if (delayed.empty()) return;
+    for (int c = 0; c < cells; ++c) {
+        const int mat = material_id[c];
+        for (int i = 0; i < I; ++i)
+            out[c * I + i] =
+                delayed.bet(mat, i) * production[c] / delayed.lam(i);
+    }
+}
+
+// ============================================================================
+// Fixed-point acceleration for the implicit-fission inner iteration
+// ============================================================================
+//
+// With an implicit fission source the inner sweep is the fixed point
+//
+//     phi <- (A + 1/(v dt))^-1 [ chi_eff F(phi) + S ],
+//
+// whose iteration matrix has spectral radius roughly
+//
+//     k_step = production / (loss + 1/(v dt)).
+//
+// The 1/(v dt) term is the only thing keeping that below 1, so a near-critical
+// problem at a dt where 1/(v dt) << Sigma_r converges at nearly one digit per
+// hundreds of sweeps.  The error is dominated by a single mode (the fundamental
+// flux shape), which is exactly the situation Aitken's Delta^2 handles: estimate
+// the convergence ratio from successive iterate changes and jump to the limit of
+// the geometric series in one step.
+//
+//     sigma = ||d_m|| / ||d_{m-1}||,   phi <- phi + sigma/(1-sigma) * d_m
+//
+// Safeguards matter more than the extrapolation itself.  The ratio is only
+// trusted after it has held steady for two iterations - measured relative to
+// (1 - sigma), since near sigma = 1 a 5% change in sigma moves the extrapolation
+// factor by orders of magnitude - and the jump is capped relative to the current
+// flux magnitude.  A bad extrapolation is self-correcting: the residual is
+// measured across the *sweep*, so an iterate thrown to the wrong place produces
+// a large change on the next sweep rather than a false convergence.
+
+/// Aitken (Delta^2) accelerator for the implicit-fission fixed point.
+///
+/// Usage: after each inner sweep, call accelerate() with the new iterate and
+/// the previous one.  It may overwrite `phi` with an extrapolated iterate.
+class FissionAccelerator {
+public:
+    /// @param enabled Set false to disable extrapolation entirely.
+    explicit FissionAccelerator(bool enabled = true) : enabled_(enabled) {}
+
+    /// Extrapolate along the current error mode when the convergence ratio has
+    /// settled.  `phi` is the post-sweep iterate, `phi_prev` the pre-sweep one.
+    ///
+    /// @return True when `phi` was extrapolated.
+    bool accelerate(std::vector<double>& phi,
+                    const std::vector<double>& phi_prev) {
+        if (!enabled_) return false;
+
+        const int n = static_cast<int>(phi.size());
+        double dn = 0.0;
+        for (int i = 0; i < n; ++i) {
+            const double d = phi[i] - phi_prev[i];
+            dn += d * d;
+        }
+        dn = std::sqrt(dn);
+        if (dn == 0.0) { reset(); return false; }
+
+        const double prev = norm_prev_;
+        norm_prev_ = dn;
+        if (prev <= 0.0) return false;
+
+        const double sigma = dn / prev;
+        const double sigma_prev = sigma_prev_;
+        sigma_prev_ = sigma;
+
+        // Only a decaying, non-trivial mode is worth extrapolating: below
+        // kSigmaMin the iteration is already fast, and at or above 1 the
+        // geometric-series limit does not exist.
+        if (!(sigma > kSigmaMin && sigma < kSigmaMax)) { stable_ = 0; return false; }
+
+        // Stability is judged against the distance from 1, which is what sets
+        // the extrapolation factor.
+        if (sigma_prev > 0.0 &&
+            std::fabs(sigma - sigma_prev) < kStableFrac * (1.0 - sigma))
+            ++stable_;
+        else
+            stable_ = 0;
+
+        if (cooldown_ > 0) { --cooldown_; return false; }
+        if (stable_ < kStableNeeded) return false;
+
+        const double factor = sigma / (1.0 - sigma);
+
+        // Never jump further than kMaxJump times the current flux magnitude -
+        // a mis-estimated ratio must not throw the iterate somewhere the sweep
+        // cannot recover from.
+        double phi_norm = 0.0;
+        for (int i = 0; i < n; ++i) phi_norm += phi[i] * phi[i];
+        phi_norm = std::sqrt(phi_norm);
+        if (factor * dn > kMaxJump * phi_norm) { stable_ = 0; return false; }
+
+        for (int i = 0; i < n; ++i)
+            phi[i] += factor * (phi[i] - phi_prev[i]);
+
+        // The change history describes the pre-extrapolation mode, so it is
+        // meaningless now; start the estimate over and wait before trying again.
+        reset();
+        cooldown_ = kCooldown;
+        return true;
+    }
+
+    /// Forget the convergence-ratio history (call between time steps).
+    void reset() {
+        norm_prev_  = -1.0;
+        sigma_prev_ = -1.0;
+        stable_     = 0;
+    }
+
+private:
+    static constexpr double kSigmaMin    = 0.05;   ///< Below this, no help needed
+    static constexpr double kSigmaMax    = 0.9999; ///< Above this, ratio untrustworthy
+    static constexpr double kStableFrac  = 0.05;   ///< |dsigma| < 5% of (1-sigma)
+    static constexpr int    kStableNeeded = 2;     ///< Consecutive stable estimates
+    static constexpr int    kCooldown    = 2;      ///< Sweeps to wait after a jump
+    static constexpr double kMaxJump     = 10.0;   ///< Max jump / ||phi||
+
+    bool   enabled_;
+    double norm_prev_  = -1.0;
+    double sigma_prev_ = -1.0;
+    int    stable_     = 0;
+    int    cooldown_   = 0;
+};
+
+// ============================================================================
 // Power iteration  A phi = (1/k) B phi
 // ============================================================================
 
@@ -309,6 +773,22 @@ inline void warn_inner_not_converged(const char* solver, int max_inner) {
         "within max_inner=%d; the k-eigenvalue may be inaccurate. Increase "
         "max_inner (finer and multi-group meshes need more inner iterations).\n",
         solver, max_inner);
+}
+
+/// Emit a stderr warning when a backward-Euler time step's inner iteration hits
+/// its cap.  With an implicit fission source the inner sweep must resolve the
+/// multiplication as well as the scatter coupling; the 1/(v*dt) diagonal term
+/// keeps that strongly diagonally dominant for small dt, but a near-critical
+/// system at large dt converges slowly and silently wrong transients are worse
+/// than slow ones.  Warned once per solver instance by the caller.
+inline void warn_step_not_converged(const char* solver, int max_inner,
+                                    double dt, double residual) {
+    std::fprintf(stderr,
+        "ndiffusion warning: %s time step (dt=%.3e) did not converge within "
+        "max_inner=%d (relative change %.3e); the transient may be inaccurate. "
+        "Reduce dt or increase max_inner - a near-critical system at large dt "
+        "needs more inner iterations once fission is treated implicitly.\n",
+        solver, dt, max_inner, residual);
 }
 
 // ============================================================================

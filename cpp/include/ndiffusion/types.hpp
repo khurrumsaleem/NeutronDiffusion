@@ -143,6 +143,87 @@ struct Materials {
 };
 
 // ============================================================================
+// Delayed neutron data
+// ============================================================================
+
+/**
+ * @brief Delayed neutron precursor data for the time-dependent solvers.
+ *
+ * Kept separate from Materials because it is kinetics-only: the k-eigenvalue and
+ * fixed-source solvers never see it, and a steady-state cross-section library
+ * usually carries no precursor data at all.
+ *
+ * @par Array layouts
+ *  - `lambda`:      `[n_precursor]`  decay constants (1/s)
+ *  - `beta`:        `[n_mat * n_precursor]`  delayed fractions per material
+ *  - `chi_delayed`: `[n_mat * n_precursor * n_groups]`  delayed fission spectrum
+ *  - `chi_prompt`:  `[n_mat * n_groups]`, or empty to use `Materials::chi`
+ *
+ * A default-constructed instance (`n_precursor == 0`) disables delayed neutrons,
+ * reducing the time-dependent solvers to prompt-only kinetics.
+ *
+ * @note Delayed neutrons require the standard `chi` / `nusigf` representation.
+ *       Fission-matrix mode (see Materials::use_fission_matrix()) has no
+ *       separable fission spectrum to split into prompt and delayed parts, so
+ *       the combination is rejected by the solver constructors.
+ */
+struct DelayedNeutronData {
+    int n_precursor = 0;  ///< Number of precursor groups; 0 disables delayed neutrons
+
+    std::vector<double> lambda;       ///< Decay constants (1/s)  [n_precursor]
+    std::vector<double> beta;         ///< Delayed fractions      [n_mat * n_precursor]
+    std::vector<double> chi_delayed;  ///< Delayed fission spectrum
+                                      ///<   [n_mat * n_precursor * n_groups]
+    std::vector<double> chi_prompt;   ///< Prompt fission spectrum [n_mat * n_groups];
+                                      ///<   empty -> use Materials::chi
+
+    /// @return True when no precursor groups are defined (prompt-only kinetics).
+    bool empty() const { return n_precursor == 0; }
+
+    /**
+     * @brief Decay constant of a precursor group.
+     *
+     * @param i Precursor-group index.
+     * @return Decay constant (1/s) for precursor group @p i.
+     */
+    double lam (int i) const { return lambda[i]; }
+
+    /**
+     * @brief Delayed fraction for a material and precursor group.
+     *
+     * @param m Material index.
+     * @param i Precursor-group index.
+     * @return Delayed neutron fraction beta_i for material @p m.
+     */
+    double bet (int m, int i) const { return beta[m * n_precursor + i]; }
+
+    /**
+     * @brief Delayed fission spectrum entry.
+     *
+     * @param m Material index.
+     * @param i Precursor-group index.
+     * @param g Energy-group index.
+     * @param n_groups Number of energy groups.
+     * @return Fraction of precursor-group @p i decay neutrons born into group @p g.
+     */
+    double chi_d(int m, int i, int g, int n_groups) const {
+        return chi_delayed[(m * n_precursor + i) * n_groups + g];
+    }
+
+    /**
+     * @brief Total delayed fraction for a material, summed over precursor groups.
+     *
+     * @param m Material index.
+     * @return beta = sum_i beta_i for material @p m.
+     */
+    double beta_total(int m) const {
+        double b = 0.0;
+        for (int i = 0; i < n_precursor; ++i) b += bet(m, i);
+        return b;
+    }
+};
+
+// ============================================================================
 // Boundary conditions
 // ============================================================================
 
@@ -199,6 +280,11 @@ struct TimeDependentResult {
     std::vector<double> flux;  ///< Physical flux [cells * n_groups], row-major: flux[i*G+g]
     double time;               ///< Total elapsed simulated time (s)
     int    steps;              ///< Number of time steps taken
+
+    /// Delayed neutron precursor concentrations per unit volume,
+    /// `[cells * n_precursor]`, row-major: `precursors[i*I+p]`.
+    /// Empty when the solver was built without delayed neutron data.
+    std::vector<double> precursors;
 };
 
 // ============================================================================
